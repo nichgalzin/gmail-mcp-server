@@ -3,6 +3,8 @@
 import base64
 from email.mime.text import MIMEText
 
+from googleapiclient.errors import HttpError
+
 from .gmail_auth import get_gmail_service
 
 
@@ -20,15 +22,27 @@ async def fetch_unread_emails(limit: int = 10) -> list[dict]:
         - subject: Email subject
         - date: Date received
         - body: Email body text (plain text preferred, falls back to snippet)
+
+    Raises:
+        ValueError: If limit is out of valid range
     """
+    # Validate limit parameter
+    if not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    if limit > 100:
+        raise ValueError("limit must not exceed 100")
+
     service = get_gmail_service()
 
     # Query for unread messages in inbox
-    results = service.users().messages().list(
-        userId="me",
-        q="is:unread",
-        maxResults=limit
-    ).execute()
+    results = (
+        service.users()
+        .messages()
+        .list(userId="me", q="is:unread", maxResults=limit)
+        .execute()
+    )
 
     messages = results.get("messages", [])
 
@@ -38,32 +52,43 @@ async def fetch_unread_emails(limit: int = 10) -> list[dict]:
     emails = []
 
     for msg in messages:
-        # Fetch full message details
-        message = service.users().messages().get(
-            userId="me",
-            id=msg["id"],
-            format="full"
-        ).execute()
+        try:
+            # Fetch full message details
+            message = (
+                service.users()
+                .messages()
+                .get(userId="me", id=msg["id"], format="full")
+                .execute()
+            )
 
-        # Extract headers
-        headers = message.get("payload", {}).get("headers", [])
-        subject = _get_header(headers, "Subject")
-        from_addr = _get_header(headers, "From")
-        date = _get_header(headers, "Date")
+            # Extract headers
+            headers = message.get("payload", {}).get("headers", [])
+            subject = _get_header(headers, "Subject")
+            from_addr = _get_header(headers, "From")
+            date = _get_header(headers, "Date")
 
-        # Extract body
-        body = _get_message_body(message)
+            # Extract body
+            body = _get_message_body(message)
 
-        email_info = {
-            "id": message["id"],
-            "thread_id": message["threadId"],
-            "from": from_addr,
-            "subject": subject,
-            "date": date,
-            "body": body,
-        }
+            email_info = {
+                "id": message["id"],
+                "thread_id": message["threadId"],
+                "from": from_addr,
+                "subject": subject,
+                "date": date,
+                "body": body,
+            }
 
-        emails.append(email_info)
+            emails.append(email_info)
+
+        except HttpError:
+            # Skip messages that fail to fetch (e.g., deleted, permission issues)
+            # Continue processing remaining messages
+            continue
+        except Exception:
+            # Skip messages with unexpected errors
+            # Continue processing remaining messages
+            continue
 
     return emails
 
@@ -80,14 +105,24 @@ async def create_draft_reply(thread_id: str, reply_body: str) -> dict:
         - draft_id: ID of the created draft
         - message_id: ID of the draft message
         - thread_id: Thread ID the draft belongs to
+
+    Raises:
+        ValueError: If thread_id or reply_body is invalid
     """
+    # Validate inputs
+    if not thread_id or not isinstance(thread_id, str):
+        raise ValueError("thread_id must be a non-empty string")
+    if not reply_body or not isinstance(reply_body, str):
+        raise ValueError("reply_body must be a non-empty string")
+    if not thread_id.strip():
+        raise ValueError("thread_id cannot be whitespace only")
+    if not reply_body.strip():
+        raise ValueError("reply_body cannot be whitespace only")
+
     service = get_gmail_service()
 
     # Get the original thread to extract necessary info for proper threading
-    thread = service.users().threads().get(
-        userId="me",
-        id=thread_id
-    ).execute()
+    thread = service.users().threads().get(userId="me", id=thread_id).execute()
 
     # Get the last message in the thread (the one we're replying to)
     messages = thread.get("messages", [])
@@ -139,10 +174,7 @@ async def create_draft_reply(thread_id: str, reply_body: str) -> dict:
         }
     }
 
-    draft = service.users().drafts().create(
-        userId="me",
-        body=draft_body
-    ).execute()
+    draft = service.users().drafts().create(userId="me", body=draft_body).execute()
 
     return {
         "draft_id": draft["id"],

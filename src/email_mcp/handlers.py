@@ -1,6 +1,7 @@
 """MCP tool handlers for email operations."""
 
 import mcp.types as types
+from googleapiclient.errors import HttpError
 
 from . import email_service
 
@@ -57,40 +58,63 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
     Raises:
         ValueError: If tool name is unknown
     """
-    if name == "get_unread_emails":
-        limit = arguments.get("limit", 10)
-        emails = await email_service.fetch_unread_emails(limit)
+    try:
+        if name == "get_unread_emails":
+            limit = arguments.get("limit", 10)
+            emails = await email_service.fetch_unread_emails(limit)
 
-        if not emails:
-            return [types.TextContent(type="text", text="No unread emails found")]
+            if not emails:
+                return [types.TextContent(type="text", text="No unread emails found")]
 
-        # Format the email list for display
-        email_list = []
-        for email in emails:
-            email_summary = f"Thread ID: {email['thread_id']}\n"
-            email_summary += f"Message ID: {email['id']}\n"
-            email_summary += f"From: {email['from']}\n"
-            email_summary += f"Subject: {email['subject']}\n"
-            email_summary += f"Date: {email['date']}\n"
-            email_summary += f"Body:\n{email['body']}\n"
-            email_summary += "-" * 80
-            email_list.append(email_summary)
+            # Format the email list for display
+            email_list = []
+            for email in emails:
+                email_summary = f"Thread ID: {email['thread_id']}\n"
+                email_summary += f"Message ID: {email['id']}\n"
+                email_summary += f"From: {email['from']}\n"
+                email_summary += f"Subject: {email['subject']}\n"
+                email_summary += f"Date: {email['date']}\n"
+                email_summary += f"Body:\n{email['body']}\n"
+                email_summary += "-" * 80
+                email_list.append(email_summary)
 
-        result = f"Found {len(emails)} unread email(s):\n\n" + "\n\n".join(email_list)
-        return [types.TextContent(type="text", text=result)]
+            result = f"Found {len(emails)} unread email(s):\n\n" + "\n\n".join(email_list)
+            return [types.TextContent(type="text", text=result)]
 
-    elif name == "create_draft_reply":
-        thread_id = arguments["thread_id"]
-        reply_body = arguments["reply_body"]
+        elif name == "create_draft_reply":
+            thread_id = arguments["thread_id"]
+            reply_body = arguments["reply_body"]
 
-        draft_info = await email_service.create_draft_reply(thread_id, reply_body)
+            draft_info = await email_service.create_draft_reply(thread_id, reply_body)
 
-        result = (
-            f"✓ Draft reply created successfully!\n\n"
-            f"Draft ID: {draft_info['draft_id']}\n"
-            f"Thread ID: {draft_info['thread_id']}\n\n"
-            f"The draft has been added to the email thread in Gmail."
-        )
-        return [types.TextContent(type="text", text=result)]
+            result = (
+                f"✓ Draft reply created successfully!\n\n"
+                f"Draft ID: {draft_info['draft_id']}\n"
+                f"Thread ID: {draft_info['thread_id']}\n\n"
+                f"The draft has been added to the email thread in Gmail."
+            )
+            return [types.TextContent(type="text", text=result)]
 
-    raise ValueError(f"Unknown tool: {name}")
+        raise ValueError(f"Unknown tool: {name}")
+
+    except HttpError as e:
+        # Handle Gmail API errors (auth failures, rate limits, not found, etc.)
+        error_msg = f"Gmail API error: {e.reason}"
+        if e.resp.status == 404:
+            error_msg = f"Resource not found: {e.reason}"
+        elif e.resp.status == 401:
+            error_msg = "Authentication failed. Please re-authenticate with Gmail."
+        elif e.resp.status == 403:
+            error_msg = f"Permission denied: {e.reason}"
+        elif e.resp.status == 429:
+            error_msg = "Rate limit exceeded. Please try again later."
+
+        return [types.TextContent(type="text", text=error_msg)]
+
+    except ValueError as e:
+        # Handle validation errors
+        return [types.TextContent(type="text", text=f"Validation error: {str(e)}")]
+
+    except Exception as e:
+        # Catch-all for unexpected errors
+        return [types.TextContent(type="text", text=f"Unexpected error: {str(e)}")]

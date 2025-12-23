@@ -55,7 +55,13 @@ def get_gmail_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             # Refresh expired credentials
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to refresh credentials: {e}\n"
+                    "You may need to delete token.json and re-authenticate."
+                )
         else:
             # Start new OAuth flow
             if not credentials_file.exists():
@@ -75,4 +81,7 @@ def get_gmail_service():
         token_file.write_text(creds.to_json())
 
     # Build and return the Gmail API service
-    return build("gmail", "v1", credentials=creds)
+    try:
+        return build("gmail", "v1", credentials=creds)
+    except Exception as e:
+        raise RuntimeError(f"Failed to build Gmail service: {e}")
