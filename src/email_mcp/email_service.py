@@ -1,212 +1,223 @@
-"""Email service module for IMAP/SMTP operations."""
+"""Email service module for Gmail API operations."""
 
-import os
-import smtplib
-from email import message_from_bytes
-from email.mime.multipart import MIMEMultipart
+import base64
 from email.mime.text import MIMEText
 
-from imapclient import IMAPClient
+from .gmail_auth import get_gmail_service
 
 
-async def send_email(to: str, subject: str, body: str) -> None:
-    """Send an email via SMTP.
-
-    Args:
-        to: Recipient email address
-        subject: Email subject
-        body: Email body content
-    """
-    email_user = os.environ["EMAIL_USER"]
-    email_password = os.environ["EMAIL_APP_PASSWORD"]
-
-    msg = MIMEMultipart()
-    msg["From"] = email_user
-    msg["To"] = to
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(email_user, email_password)
-        server.send_message(msg)
-
-
-async def fetch_unread_emails(
-    limit: int = 10, folder: str = "[Gmail]/Important"
-) -> list[dict]:
-    """Fetch unread emails from Gmail via IMAP.
+async def fetch_unread_emails(limit: int = 10) -> list[dict]:
+    """Fetch unread emails from Gmail using Gmail API.
 
     Args:
         limit: Maximum number of emails to fetch
-        folder: Gmail folder to search
 
     Returns:
-        List of email dictionaries with id, from, subject, date, and body
+        List of email dictionaries with:
+        - id: Message ID
+        - thread_id: Thread ID (for creating threaded replies)
+        - from: Sender email address
+        - subject: Email subject
+        - date: Date received
+        - body: Email body text (plain text preferred, falls back to snippet)
     """
-    email_user = os.environ["EMAIL_USER"]
-    email_password = os.environ["EMAIL_APP_PASSWORD"]
+    service = get_gmail_service()
 
-    # Connect to Gmail IMAP server
-    with IMAPClient("imap.gmail.com", ssl=True) as client:
-        # Login with your credentials
-        client.login(email_user, email_password)
+    # Query for unread messages in inbox
+    results = service.users().messages().list(
+        userId="me",
+        q="is:unread",
+        maxResults=limit
+    ).execute()
 
-        # Select the specified folder
-        client.select_folder(folder)
+    messages = results.get("messages", [])
 
-        # Search for unread emails
-        unread_messages = client.search("UNSEEN")
+    if not messages:
+        return []
 
-        # Limit the number of emails to process
-        limited_messages = (
-            unread_messages[:limit] if len(unread_messages) > limit else unread_messages
-        )
+    emails = []
 
-        emails = []
+    for msg in messages:
+        # Fetch full message details
+        message = service.users().messages().get(
+            userId="me",
+            id=msg["id"],
+            format="full"
+        ).execute()
 
-        # Fetch basic info for each unread email
-        for msg_id in limited_messages:
-            # Fetch the email data
-            fetch_data = client.fetch([msg_id], ["RFC822"])
-            raw_message = fetch_data[msg_id][b"RFC822"]
+        # Extract headers
+        headers = message.get("payload", {}).get("headers", [])
+        subject = _get_header(headers, "Subject")
+        from_addr = _get_header(headers, "From")
+        date = _get_header(headers, "Date")
 
-            # Parse the email - ensure we have bytes
-            if isinstance(raw_message, bytes):
-                email_message = message_from_bytes(raw_message)
-            else:
-                continue  # Skip if not proper format
+        # Extract body
+        body = _get_message_body(message)
 
-            # Extract basic information
-            email_info = {
-                "id": str(msg_id),
-                "from": email_message.get("From", ""),
-                "subject": email_message.get("Subject", ""),
-                "date": email_message.get("Date", ""),
-                "body": _get_email_body(email_message),
-            }
+        email_info = {
+            "id": message["id"],
+            "thread_id": message["threadId"],
+            "from": from_addr,
+            "subject": subject,
+            "date": date,
+            "body": body,
+        }
 
-            emails.append(email_info)
+        emails.append(email_info)
 
-        return emails
+    return emails
 
 
-def _get_email_body(email_message) -> str:
-    """Extract the body text from an email message.
+async def create_draft_reply(thread_id: str, reply_body: str) -> dict:
+    """Create a draft reply to an email thread.
 
     Args:
-        email_message: Parsed email message object
+        thread_id: The Gmail thread ID to reply to
+        reply_body: The body text of the reply
 
     Returns:
-        Email body as string
+        Dictionary with draft information:
+        - draft_id: ID of the created draft
+        - message_id: ID of the draft message
+        - thread_id: Thread ID the draft belongs to
     """
-    if email_message.is_multipart():
-        # Handle multipart emails (HTML + text)
-        for part in email_message.walk():
-            if part.get_content_type() == "text/plain":
-                return part.get_payload(decode=True).decode("utf-8", errors="ignore")
-    else:
-        # Handle simple text emails
-        return email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
+    service = get_gmail_service()
 
+    # Get the original thread to extract necessary info for proper threading
+    thread = service.users().threads().get(
+        userId="me",
+        id=thread_id
+    ).execute()
+
+    # Get the last message in the thread (the one we're replying to)
+    messages = thread.get("messages", [])
+    if not messages:
+        raise ValueError(f"No messages found in thread {thread_id}")
+
+    original_message = messages[-1]
+    headers = original_message.get("payload", {}).get("headers", [])
+
+    # Extract headers needed for proper threading
+    to_addr = _get_header(headers, "From")  # Reply to the sender
+    subject = _get_header(headers, "Subject")
+    message_id = _get_header(headers, "Message-ID")
+    references = _get_header(headers, "References") or ""
+
+    # Build References header for proper threading
+    # References should include all previous Message-IDs plus the one we're replying to
+    if references:
+        references_list = references.strip().split()
+        if message_id and message_id not in references_list:
+            references_list.append(message_id)
+        new_references = " ".join(references_list)
+    else:
+        new_references = message_id if message_id else ""
+
+    # Ensure subject has "Re:" prefix if not already present
+    if subject and not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+
+    # Create the MIME message
+    message = MIMEText(reply_body)
+    message["To"] = to_addr
+    message["Subject"] = subject
+
+    # Critical headers for proper threading
+    if message_id:
+        message["In-Reply-To"] = message_id
+    if new_references:
+        message["References"] = new_references
+
+    # Encode the message
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    # Create the draft with threadId for proper threading
+    draft_body = {
+        "message": {
+            "raw": raw_message,
+            "threadId": thread_id,  # Critical: ensures draft appears in the thread
+        }
+    }
+
+    draft = service.users().drafts().create(
+        userId="me",
+        body=draft_body
+    ).execute()
+
+    return {
+        "draft_id": draft["id"],
+        "message_id": draft["message"]["id"],
+        "thread_id": draft["message"]["threadId"],
+    }
+
+
+def _get_header(headers: list[dict], name: str) -> str:
+    """Extract a specific header value from email headers.
+
+    Args:
+        headers: List of header dictionaries
+        name: Header name to find
+
+    Returns:
+        Header value or empty string if not found
+    """
+    for header in headers:
+        if header.get("name", "").lower() == name.lower():
+            return header.get("value", "")
     return ""
 
 
-async def debug_gmail_folders() -> dict:
-    """Debug function to see what folders/labels Gmail exposes via IMAP.
-
-    Returns:
-        Dictionary with folders and sample message flags
-    """
-    email_user = os.environ["EMAIL_USER"]
-    email_password = os.environ["EMAIL_APP_PASSWORD"]
-
-    with IMAPClient("imap.gmail.com", ssl=True) as client:
-        client.login(email_user, email_password)
-
-        # List all folders
-        folders = client.list_folders()
-
-        # Also check what's in INBOX
-        client.select_folder("INBOX")
-
-        # Get a sample of messages to see their flags/labels
-        all_messages = client.search("ALL")
-        sample_flags = None
-        if all_messages:
-            sample_msg = all_messages[0]
-            fetch_data = client.fetch([sample_msg], ["FLAGS", "X-GM-LABELS"])
-            sample_flags = fetch_data
-
-        return {
-            "folders": folders,
-            "sample_flags": sample_flags,
-        }
-
-
-async def debug_email_filtering(limit: int = 5) -> list[dict]:
-    """Debug function to show email filtering details.
+def _get_message_body(message: dict) -> str:
+    """Extract the plain text body from a Gmail message.
 
     Args:
-        limit: Number of emails to analyze
+        message: Gmail message object
 
     Returns:
-        List of email debug information
+        Plain text body, or snippet if body extraction fails
     """
-    email_user = os.environ["EMAIL_USER"]
-    email_password = os.environ["EMAIL_APP_PASSWORD"]
+    payload = message.get("payload", {})
 
-    with IMAPClient("imap.gmail.com", ssl=True) as client:
-        client.login(email_user, email_password)
-        client.select_folder("INBOX")
+    # Try to get the body from the payload
+    body = _extract_body_from_payload(payload)
 
-        # Get unread messages
-        unread_messages = client.search("UNSEEN")
-        limited_messages = (
-            unread_messages[:limit] if len(unread_messages) > limit else unread_messages
-        )
+    # Fall back to snippet if we couldn't extract the body
+    if not body:
+        body = message.get("snippet", "")
 
-        debug_info = []
+    return body
 
-        for msg_id in limited_messages:
-            fetch_data = client.fetch([msg_id], ["RFC822"])
-            raw_message = fetch_data[msg_id][b"RFC822"]
 
-            if isinstance(raw_message, bytes):
-                email_message = message_from_bytes(raw_message)
+def _extract_body_from_payload(payload: dict) -> str:
+    """Recursively extract text/plain body from message payload.
 
-                from_addr = email_message.get("From", "")
-                subject = email_message.get("Subject", "")
+    Args:
+        payload: Message payload object
 
-                # Check promotional patterns
-                promotional_patterns = [
-                    "noreply",
-                    "no-reply",
-                    "donotreply",
-                    "do-not-reply",
-                    "newsletter",
-                    "marketing",
-                    "promo",
-                    "offer",
-                    "automated",
-                    "notification",
-                    "alert",
-                    "support",
-                ]
+    Returns:
+        Decoded plain text body
+    """
+    # Check if this part has a body
+    if "body" in payload and "data" in payload["body"]:
+        mime_type = payload.get("mimeType", "")
+        if mime_type == "text/plain":
+            # Decode the base64-encoded body
+            body_data = payload["body"]["data"]
+            return base64.urlsafe_b64decode(body_data).decode("utf-8", errors="ignore")
 
-                matched_patterns = [
-                    p for p in promotional_patterns if p in from_addr.lower()
-                ]
-                is_promotional = len(matched_patterns) > 0
+    # If multipart, recursively search parts
+    if "parts" in payload:
+        for part in payload["parts"]:
+            # Prefer text/plain over text/html
+            if part.get("mimeType") == "text/plain":
+                result = _extract_body_from_payload(part)
+                if result:
+                    return result
 
-                debug_info.append(
-                    {
-                        "id": str(msg_id),
-                        "from": from_addr,
-                        "subject": subject,
-                        "is_promotional": is_promotional,
-                        "matched_patterns": matched_patterns,
-                    }
-                )
+        # If no text/plain found, try any part
+        for part in payload["parts"]:
+            result = _extract_body_from_payload(part)
+            if result:
+                return result
 
-        return debug_info
+    return ""
